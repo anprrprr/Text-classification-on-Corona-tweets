@@ -1,0 +1,373 @@
+---
+title: "Homework: Text classification"
+author: "Anna Tedikova"
+date: "31 10 2022"
+output:
+  html_document:
+    css: style.css
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.align = 'center', echo = TRUE)
+library(readr)
+library(tidytext)
+library(dplyr)
+library("stopwords")
+library(textstem)
+library(SnowballC)
+library(stringr)
+library(here)
+library(stringi)
+library(tidyr)
+library(quanteda.textstats)
+library(quanteda)
+library(data.table)
+library(caret)
+library(quanteda.textmodels)
+library(ggplot2)
+library(tibble)
+library(knitr)
+```
+
+First, load the data.
+
+```{r data, warning=FALSE, show_col_types = FALSE, message=FALSE}
+data <- read_csv("C:/Users/Anna/Desktop/Corona_NLP_train.csv")
+head(data)
+```
+
+## 1. Text Preprocessing
+
+Here we prepare data for tokenization, exclude neutral tweets, and add column doc_id.
+
+```{r, warning=FALSE}
+data <- data %>% mutate(OriginalTweet = stri_replace_all_regex(OriginalTweet,
+                                  pattern=c("\u0091", "\u0092", "\u0093", "\u0094", "\u0095", "\u0096", "\u0097", "\u0099", "\u0080", "\u0084", "\u009e", "\u009a"),
+                                  replacement=c("'", "'", "'", "'", "", "", "", "", "", "", "", ""),
+                                  vectorize=FALSE))
+
+data_pn <- data %>% filter(Sentiment != "Neutral") %>% mutate(sent_posneg = recode(Sentiment, 
+  "Extremely Positive" = "positive",
+  "Positive" = "positive",
+  .default = "negative"))  %>% 
+  select(OriginalTweet, sent_posneg)
+
+data_pn <- data_pn %>% mutate(doc_id = row_number())
+
+head(data_pn)
+```
+
+Then we proceed to preprocessing the subset data: exclude stopwords, tokenize the tweets - splitting them into units appropriate for analysis. Finally, we lemmatize tokens. The word may have different forms of it but duplicates of the same word will not be informative to us so we create lemmas that reduce different forms of one word to one form. We also delete punctuation and numbers.
+
+```{r, warning=FALSE, message=FALSE}
+data_pn$text_clean <- iconv(data_pn$OriginalTweet, "UTF-8", "UTF-8", sub = '')
+data_pn$text_clean <- gsub("[[:punct:]]", " ", data_pn$text_clean)
+enstopwords <- tibble(word = stopwords("en"))
+tweets_tok <- unnest_tokens(data_pn, word, text_clean, token = "tweets")
+
+data_lemmas <- tweets_tok %>%
+    mutate(lem = lemmatize_words(word)) %>%
+    filter(! lem %in% stopwords("en")) %>%
+    filter(! str_detect(lem, "[0-9]+"))
+
+head(data_lemmas)
+```
+
+## 2. EDA
+
+First, we need to create a frequency list of our lemmas.
+
+```{r, warning=FALSE}
+freqlist <- data_lemmas %>% count(lem, sort=TRUE)
+kable(head(freqlist))
+```
+
+Next, we count total size of the corpus (all lemmas) and vocabulary size (distinct lemmas).
+```{r, warning=FALSE}
+sum(freqlist$n)
+
+data_lemmas %>% distinct(lem) %>% nrow
+```
+
+We can see that there are les unique lemmas, so some of them are repeated thoughout the corpus.
+
+### Class distribution
+
+We make a table with counts of lemmas in positive and negative corpuses. It seems that the negative corpus is smaller, but the difference is not great.
+
+```{r, warning=FALSE}
+kable(table(data_lemmas$sent_posneg),
+      col.names = c("Sentiment", "Freq"))
+```
+
+To make data for comparisons, we now create lemma frequency lists for 2 types of sentiments.
+Filter out rare words (n <= 10 for both types).
+
+```{r, warning=FALSE}
+posneg.lemmas <- data_lemmas %>%
+    dplyr::count(lem, sent_posneg) %>%
+    spread(sent_posneg, n, fill = 0) %>%
+    dplyr::filter(positive > 10 | negative > 10)
+kable(head(posneg.lemmas))
+```
+
+We can use G2 and logratios for each type to try and see the difference in words used.
+
+```{r, warning=FALSE}
+g2 = function(a, b) {
+  c = sum(a)
+  d = sum(b)
+  E1 = c * ((a + b) / (c + d))
+  E2 = d * ((a + b) / (c + d))
+  return(2*((a*log(a/E1+1e-7)) + (b*log(b/E2+1e-7))))
+}
+```
+
+Now we can calculate log-likelihood for lemma frequency differences for each type of sentiment:
+
+```{r}
+emotion.g2 <- posneg.lemmas %>% 
+    mutate(g2=g2(positive, negative)) %>%
+    arrange(desc(g2)) %>%
+    mutate(g2 = round(g2, 2))
+kable(head(emotion.g2))
+```
+
+#### Effect size. Log Ratio
+
+So we are going to supplement our log-likelihood tests with an effect size measure that allow to quantify, how large exactly is the difference of frequencies.
+
+Here we define a function similar to g2, and apply it to our data. 
+
+```{r, warning=FALSE}
+logratio <- function(a, b) {
+    return(log2((a/sum(a)/(b/sum(b)))))
+}
+```
+
+Now we may add odds to our table.
+
+```{r, warning=FALSE}
+emotion.lr <- emotion.g2 %>%
+    mutate(logodds = logratio(positive, negative))
+```
+
+Words used evenly in tweets of both sentiments:
+
+```{r, warning=FALSE}
+head(emotion.lr) %>%
+    arrange(abs(logodds))
+```
+
+Words most acutely overused in tweets of one or another sentiment:
+
+```{r, warning=FALSE}
+emotion.disproportion <- emotion.lr %>%
+    dplyr::filter(positive > 0 & negative > 0) %>%
+    group_by(logodds < 0) %>%
+    top_n(15, abs(logodds)) %>%
+    ungroup()
+kable(head(emotion.disproportion))
+```
+
+The same result in a plot.
+
+```{r, warning=FALSE}
+emotion.lr %>%
+    filter(positive > 0 & negative > 0) %>%
+    group_by(logodds < 0) %>%
+    top_n(15, abs(logodds)) %>%
+    ungroup() %>%
+    mutate(lem = reorder(lem, logodds)) %>%
+    ggplot(aes(lem, logodds, fill = logodds > 0)) +
+    geom_col(show.legend = FALSE) +
+    coord_flip() +
+    ylab("Log odds ratio (Positive/Negative)") +
+    scale_fill_discrete(name = "", labels = c("Positive", "Negative"))
+```
+
+We can see in the plot some characteristic words: in negative tweets there are swear words (bullshit) or ones that denote bad things (destruction, desperation), whilst in positive there are words denoting something good (beautiful, success, hug).
+
+## 3. Preparing data for classification
+
+First, we calculate lemmas frequency in docs.
+
+```{r, warning=FALSE}
+lem_count <- data_lemmas%>% count(lem, doc_id, sort=TRUE)
+```
+
+Then, calculate TF-IDF.
+
+```{r, warning=FALSE}
+tfidf <- lem_count %>%
+    bind_tf_idf(lem, doc_id, n)
+kable(head(tfidf))
+```
+
+Next we look if there are words with zero TF-IDF (if yes, drop them to reduce the corpus size for faster analysis).
+
+```{r, warning=FALSE, eval=FALSE}
+tfidf %>% filter(tf_idf<=0) 
+```
+
+There are no such words, so we proceed with the current corpus.
+
+
+We build a matrix with the frequencies as values.
+
+```{r, warning=FALSE}
+head(tfidf) %>% 
+    cast_dfm(doc_id, lem, n)
+```
+
+Build the doc-term matrix - we will build the sparse matrix (this is just more optimized way for representing the matrix with many zeros).
+
+```{r, warning=FALSE}
+dfm <- tfidf %>% 
+    cast_dfm(doc_id, lem, tf_idf)
+head(dfm)
+```
+
+```{r, warning=FALSE}
+dfm_count <- tfidf %>%
+    filter(tf_idf>0) %>%
+    cast_dfm(doc_id, lem, n) %>% 
+    dfm_trim(min_termfreq=1, termfreq_type="count") %>% 
+    dfm_trim(min_docfreq=0.005, docfreq_type="prop")
+
+head(dfm_count)
+```
+
+In dfm matrix doc_ids are shuffled, so we select target classes according the order of doc ids in dfm matrix.
+
+```{r, warning=FALSE}
+emotion_labels <- data_lemmas$sent_posneg[as.integer(rownames(dfm_count))]
+```
+
+Next, we split our sample data into train set (90%) and test set (10%). We also fix random seed for reproducibility of the results.
+
+```{r, warning=FALSE}
+set.seed(1991)
+
+split <- createDataPartition(y=emotion_labels, p = 0.9, list = FALSE)
+
+train.data <- dfm_count %>% dfm_subset(rownames(dfm) %in% split)
+test.data <- dfm_count %>% dfm_subset(!rownames(dfm) %in% split) 
+
+response <- as.factor(emotion_labels)
+trainY <- response[split]
+testY <- response[-split]
+
+head(train.data)
+head(test.data)
+```
+
+We will use Naive Bayes which can only use the words that appear in train set during the prediction. So, we need to restrict the vocabulary of test set with the words that appear in train set.
+
+```{r, warning=FALSE}
+test.matched <- test.data %>% 
+    dfm_match(features = featnames(train.data))
+```
+
+
+## 4.Training the model
+
+I decided to choose F1-score as the main metric for this model. It is calculated from 2other values - precision and recall, and I think that is why it is better to use this particular metric. Precision are true positive results divided by all positive results (even false ones), and recall are true positive results divided by all relevant results (true positives + false negatives). So by looking at F1-score we will see the share of true positive results among most of the results we will have which can give us more accurate understanding of the model.
+
+
+There are binary features in our data set - in this case it is needed to convert the features to 0/1 (0-no such word in the doc, 1-word is in the doc).
+
+Here we train our model on the train set.
+
+```{r, warning=FALSE}
+model.nb <- textmodel_nb(train.data, trainY, distribution = "multinomial")
+summary(model.nb)
+```
+
+Then, we predict sentiment type for the docs from test set. We also calculate the probabilities of these predictions.
+
+```{r, warning=FALSE}
+predictedY <- predict(model.nb, newdata = test.matched)
+
+predicted.prob <- round(predict(model.nb, newdata = test.matched, type = "prob"), 2)
+```
+
+### Evaluating model performance for positive sentiment
+
+```{r, warning=FALSE}
+cm.nb <- confusionMatrix(data = predictedY, reference = testY, positive="positive", mode = "prec_recall")
+cm.nb
+```
+
+F1-score gives us a value of 0.5051 and we can see that is is a mean between precision and recall. This shows that about 50% of the data were classified as positive correctly. This is not a great result, because our model only correctly worked for have of the data.
+
+### Evaluating model performance for negative sentiment
+
+```{r, warning=FALSE}
+cm.nb1 <- confusionMatrix(data = predictedY, reference = testY, positive ="negative", mode = "prec_recall")
+cm.nb1
+```
+
+In case of negative sentiment F1-score is not that different - 0.4994. So again about 50% of the data was correctly classified as negative.
+
+## 5. Analysis of predictors
+
+We will use classifier for extracting the most important predictors to each class, similarly to how we earlier used g2 and logodds ratio to see most used words in each type of sentiment.
+
+```{r, warning=FALSE}
+vars.nb <- t(model.nb$param) %>% 
+    as.data.frame %>% 
+    rownames_to_column("word") %>% 
+    mutate(lo = log(positive/negative))
+```
+
+Most important predictors for class "positive"
+
+```{r, warning=FALSE}
+pred.pos <- vars.nb %>% arrange(desc(lo))
+kable(head(pred.pos))
+```
+
+These words differ from the ones we got in plots in the EDA section. However, some are similar and also denote good things (opportunity, agree, wonder, nice, relief). So we can say that the classifier gives similar results in that the predictors are also words usually used positively.
+
+
+
+Most important predictors for class "negative"
+
+```{r, warning=FALSE}
+pred.neg <- vars.nb %>% arrange(lo)
+kable(head(pred.neg))
+```
+
+Those words also differ from the ones we got in plots in the EDA section. However, some are similar and also denote bad things (alert, difficult, struggle, die, drug). There are also some swear words, although they are closer to the middle of the list. So we can say that the classifier gives similar results in that the predictors are also words usually used negatively. 
+
+### Looking at the errors
+
+Looking at the lists of predictors, there were some rather neutral words or even words that seemed more characteristic of the opposite type of sentiment. So, we may want to look at the examples where our model works not correctly
+
+```{r, warning=FALSE}
+predictions <- data.frame(doc_id=as.integer(rownames(predicted.prob)))
+predictions$pred_y <- predictedY
+predictions$pos_prob_pred <- predicted.prob[,1]
+predictions$neg_prob_pred <- predicted.prob[,2]
+predictions$true_label <- data_lemmas[rownames(predicted.prob),]$sent_posneg
+predictions$text <- data_lemmas[rownames(predicted.prob),]$OriginalTweet
+head(predictions)
+```
+
+Wrongly predicted negative tweets:
+
+```{r, warning=FALSE}
+head(predictions) %>% filter(pred_y == 'positive' & true_label == 'negative')
+```
+
+Wrongly predicted positive tweets:
+
+```{r, warning=FALSE}
+head(predictions) %>% filter(pred_y == 'negative' & true_label == 'positive')
+```
+
+Here is my a guess why some tweets were wrongly predicted. Some words (e.g. panic, disease in tweet 26660 in the second table) may have a negative meaning and be mostly used in negative tweets, but there will be some tweets in our data that also use these words in positive sentences (e.g. "protect yourself from the disease"). But as the sentiment of a tweet is predicted by words and not overall meaning of sentences, the tweet gets mislabeled.
+
